@@ -176,16 +176,10 @@ func (r *reconciler) deploymentReconciler() reconciling.NamedDeploymentReconcile
 				mountSecret(r.mergedCABundleSecretName(), getCAMountPath(operatorv1alpha1.CABundleCA), true)
 			}
 
-			// Regular front-proxies use a dedicated client CA. However the internal rootshard proxy
-			// uses the internal client CA instead to make it easier for the kcp-operator to just use
-			// a single certificate to access all components.
-			if r.frontProxy != nil {
-				// rootshard frontproxy client ca
-				mountSecret(resources.GetRootShardCAName(r.rootShard, operatorv1alpha1.FrontProxyClientCA), frontProxyBasepath+"/client-ca", true)
-			} else {
-				// kcp client ca
-				mountSecret(resources.GetRootShardCAName(r.rootShard, operatorv1alpha1.ClientCA), kcpBasepath+"/tls/client-ca", true)
-			}
+			// Mount the merged client CA (FrontProxyClientCA + ClientCA for regular
+			// front-proxies, or just ClientCA for the internal rootshard proxy) so
+			// that clients signed by the root shard's client CA are also accepted.
+			mountSecret(r.mergedClientCASecretName(), frontProxyBasepath+"/client-ca", true)
 
 			// front-proxy config
 			{
@@ -269,14 +263,11 @@ var defaultArgs = []string{
 func (r *reconciler) getArgs() []string {
 	args := defaultArgs
 
-	// rootshard proxy mode
+	args = append(args, fmt.Sprintf("--client-ca-file=%s/client-ca/tls.crt", frontProxyBasepath))
+
 	if r.frontProxy == nil {
-		args = append(args, fmt.Sprintf("--client-ca-file=%s/tls/client-ca/tls.crt", kcpBasepath))
 		return args
 	}
-
-	// regular front-proxy
-	args = append(args, fmt.Sprintf("--client-ca-file=%s/client-ca/tls.crt", frontProxyBasepath))
 
 	if auth := r.frontProxy.Spec.Auth; auth != nil {
 		if auth.DropGroups != nil {

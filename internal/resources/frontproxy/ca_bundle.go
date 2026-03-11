@@ -30,6 +30,75 @@ import (
 	operatorv1alpha1 "github.com/kcp-dev/kcp-operator/sdk/apis/operator/v1alpha1"
 )
 
+func (r *reconciler) mergedClientCASecretName() string {
+	if r.frontProxy != nil {
+		return fmt.Sprintf("%s-merged-client-ca", r.frontProxy.Name)
+	}
+	return fmt.Sprintf("%s-proxy-merged-client-ca", r.rootShard.Name)
+}
+
+// mergedClientCASecretReconciler creates a secret that merges the FrontProxyClientCA
+// and the root shard ClientCA so that the front proxy accepts clients signed by either.
+func (r *reconciler) mergedClientCASecretReconciler(ctx context.Context, kubeClient ctrlruntimeclient.Client) k8creconciling.NamedSecretReconcilerFactory {
+	return func() (string, k8creconciling.SecretReconciler) {
+		return r.mergedClientCASecretName(), func(secret *corev1.Secret) (*corev1.Secret, error) {
+			if secret.Data == nil {
+				secret.Data = make(map[string][]byte)
+			}
+
+			getCA := func(caType operatorv1alpha1.CA) ([]byte, error) {
+				caSecret := &corev1.Secret{}
+				caSecretName := resources.GetRootShardCAName(r.rootShard, caType)
+				if err := kubeClient.Get(ctx, types.NamespacedName{
+					Name:      caSecretName,
+					Namespace: r.rootShard.Namespace,
+				}, caSecret); err != nil {
+					return nil, fmt.Errorf("failed to get %s secret %s: %w", caType, caSecretName, err)
+				}
+
+				cert, ok := caSecret.Data["tls.crt"]
+				if !ok {
+					return nil, fmt.Errorf("%s secret %s missing tls.crt", caType, caSecretName)
+				}
+				return cert, nil
+			}
+
+			// Regular front-proxies merge FrontProxyClientCA + ClientCA.
+			// The internal rootshard proxy merges just ClientCA (kept as-is
+			// since shards already trust ClientCA directly).
+			cas := []operatorv1alpha1.CA{operatorv1alpha1.ClientCA}
+			if r.frontProxy != nil {
+				cas = append([]operatorv1alpha1.CA{operatorv1alpha1.FrontProxyClientCA}, cas...)
+			}
+
+			var mergedCA []byte
+			for i, ca := range cas {
+				cert, err := getCA(ca)
+				if err != nil {
+					return nil, err
+				}
+				if i > 0 {
+					mergedCA = append(mergedCA, '\n')
+				}
+				mergedCA = append(mergedCA, cert...)
+			}
+
+			secret.Data["tls.crt"] = mergedCA
+
+			if secret.Labels == nil {
+				secret.Labels = make(map[string]string)
+			}
+			if r.frontProxy != nil {
+				secret.Labels[resources.FrontProxyLabel] = r.frontProxy.Name
+			} else {
+				secret.Labels[resources.RootShardLabel] = r.rootShard.Name
+			}
+
+			return secret, nil
+		}
+	}
+}
+
 func (r *reconciler) mergedCABundleSecretName() string {
 	// Validate whether called for frontProxy or rootShardFrontProxy
 	if r.frontProxy != nil {
