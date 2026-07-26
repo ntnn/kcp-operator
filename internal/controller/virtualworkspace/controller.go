@@ -26,7 +26,6 @@ import (
 	"k8c.io/reconciler/pkg/equality"
 	k8creconciling "k8c.io/reconciler/pkg/reconciling"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,6 +43,7 @@ import (
 	"github.com/kcp-dev/kcp-operator/internal/reconciling/modifier"
 	"github.com/kcp-dev/kcp-operator/internal/resources"
 	"github.com/kcp-dev/kcp-operator/internal/resources/virtualworkspace"
+	deployv1alpha1 "github.com/kcp-dev/kcp-operator/sdk/apis/deploy/v1alpha1"
 	operatorv1alpha1 "github.com/kcp-dev/kcp-operator/sdk/apis/operator/v1alpha1"
 )
 
@@ -61,15 +61,16 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&operatorv1alpha1.RootShard{}, handler.EnqueueRequestsFromMapFunc(r.mapRootShardToVirtualWorkspaces)).
 		Watches(&operatorv1alpha1.Shard{}, handler.EnqueueRequestsFromMapFunc(r.mapShardToVirtualWorkspaces)).
 		Watches(&certmanagerv1.Issuer{}, handler.EnqueueRequestsFromMapFunc(r.mapIssuerToVirtualWorkspaces)).
+		Owns(&deployv1alpha1.CompiledVirtualWorkspace{}).
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.Service{}).
 		Owns(&certmanagerv1.Certificate{}).
-		Owns(&appsv1.Deployment{}).
 		Complete(r)
 }
 
 // +kubebuilder:rbac:groups=operator.kcp.io,resources=virtualworkspaces,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=operator.kcp.io,resources=virtualworkspaces/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=deploy.operator.kcp.io,resources=compiledvirtualworkspaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.kcp.io,resources=shards,verbs=get;list;watch
 // +kubebuilder:rbac:groups=operator.kcp.io,resources=rootshards,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -119,9 +120,8 @@ func (r *Reconciler) reconcile(ctx context.Context, vw *operatorv1alpha1.Virtual
 	var conditions []metav1.Condition
 
 	var (
-		rootShard        *operatorv1alpha1.RootShard
-		shard            *operatorv1alpha1.Shard
-		clientCertIssuer string
+		rootShard *operatorv1alpha1.RootShard
+		shard     *operatorv1alpha1.Shard
 	)
 
 	switch {
@@ -138,9 +138,6 @@ func (r *Reconciler) reconcile(ctx context.Context, vw *operatorv1alpha1.Virtual
 			})
 			return conditions, err
 		}
-
-		clientCertIssuer = resources.GetRootShardCAName(rootShard, operatorv1alpha1.ClientCA)
-		// serverCA = resources.GetRootShardCAName(rootShard, operatorv1alpha1.ServerCA)
 
 	case vw.Spec.Target.ShardRef != nil:
 		shard = &operatorv1alpha1.Shard{}
@@ -180,10 +177,6 @@ func (r *Reconciler) reconcile(ctx context.Context, vw *operatorv1alpha1.Virtual
 			return conditions, err
 		}
 
-		// The client CA is shared among all shards and owned by the root shard.
-		clientCertIssuer = resources.GetRootShardCAName(rootShard, operatorv1alpha1.ClientCA)
-		// serverCA = resources.GetRootShardCAName(rootShard, operatorv1alpha1.ServerCA)
-
 	default:
 		err := errors.New("no valid target for VirtualWorkspace found")
 		conditions = append(conditions, metav1.Condition{
@@ -203,12 +196,12 @@ func (r *Reconciler) reconcile(ctx context.Context, vw *operatorv1alpha1.Virtual
 	})
 
 	ownerRefWrapper := k8creconciling.OwnerRefWrapper(*metav1.NewControllerRef(vw, operatorv1alpha1.SchemeGroupVersion.WithKind("VirtualWorkspace")))
-	revisionLabels := modifier.RelatedRevisionsLabels(ctx, r.Client)
 
+	var certs []*certmanagerv1.Certificate
 	if err := reconciling.ReconcileCertificates(ctx, []reconciling.NamedCertificateReconcilerFactory{
-		virtualworkspace.ClientCertificateReconciler(vw, clientCertIssuer),
+		virtualworkspace.ClientCertificateReconciler(vw, rootShard),
 		virtualworkspace.ServerCertificateReconciler(vw, rootShard),
-	}, vw.Namespace, r.Client, ownerRefWrapper); err != nil {
+	}, vw.Namespace, r.Client, ownerRefWrapper, modifier.Capture(&certs)); err != nil {
 		return conditions, err
 	}
 
@@ -220,19 +213,13 @@ func (r *Reconciler) reconcile(ctx context.Context, vw *operatorv1alpha1.Virtual
 		}
 	}
 
-	if err := k8creconciling.ReconcileDeployments(ctx, []k8creconciling.NamedDeploymentReconcilerFactory{
-		virtualworkspace.DeploymentReconciler(vw, rootShard, shard),
-	}, vw.Namespace, r.Client, ownerRefWrapper, revisionLabels); err != nil {
-		// Swallow these errors and instead rely on us watching Secrets and re-reconciling whenever they change.
-		if errors.Is(err, modifier.ErrMountNotFound) {
-			err = nil
-		}
-
-		return conditions, err
+	revisions, ready := util.CertificateRevisions(certs)
+	if !ready {
+		return conditions, nil
 	}
 
-	if err := k8creconciling.ReconcileServices(ctx, []k8creconciling.NamedServiceReconcilerFactory{
-		virtualworkspace.ServiceReconciler(vw),
+	if err := reconciling.ReconcileCompiledVirtualWorkspaces(ctx, []reconciling.NamedCompiledVirtualWorkspaceReconcilerFactory{
+		virtualworkspace.CompiledVirtualWorkspaceReconciler(vw, rootShard, shard, util.MutateKeys(revisions, "cert-", "-revision")),
 	}, vw.Namespace, r.Client, ownerRefWrapper); err != nil {
 		return conditions, err
 	}
@@ -241,13 +228,11 @@ func (r *Reconciler) reconcile(ctx context.Context, vw *operatorv1alpha1.Virtual
 }
 
 func (r *Reconciler) reconcileStatus(ctx context.Context, oldVW *operatorv1alpha1.VirtualWorkspace, vw *operatorv1alpha1.VirtualWorkspace, conditions []metav1.Condition) error {
-	// Check deployment status
-	depKey := types.NamespacedName{Namespace: vw.Namespace, Name: resources.GetVirtualWorkspaceDeploymentName(vw)}
-	cond, err := util.GetDeploymentAvailableCondition(ctx, r.Client, depKey)
-	if err != nil {
+	compiled := &deployv1alpha1.CompiledVirtualWorkspace{}
+	if err := r.Get(ctx, ctrlruntimeclient.ObjectKeyFromObject(vw), compiled); ctrlruntimeclient.IgnoreNotFound(err) != nil {
 		return err
 	}
-	conditions = append(conditions, cond)
+	conditions = append(conditions, util.GetCompiledAvailableCondition(compiled.Status.Conditions, fmt.Sprintf("CompiledVirtualWorkspace %s", vw.Name)))
 
 	for _, condition := range conditions {
 		condition.ObservedGeneration = vw.Generation
